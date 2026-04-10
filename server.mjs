@@ -89,6 +89,9 @@ app.post('/send', async (req, res) => {
     subs = subs.filter(s => (s.groups ?? []).some(g => targets.values.includes(g)));
   } else if (targets?.type === 'users' && targets.values?.length > 0) {
     subs = subs.filter(s => targets.values.includes(s.endpoint));
+  } else if (targets?.type === 'emails' && targets.values?.length > 0) {
+    const emails = targets.values.map(e => e.toLowerCase());
+    subs = subs.filter(s => emails.includes((s.user?.email ?? '').toLowerCase()));
   }
 
   const results = await Promise.allSettled(
