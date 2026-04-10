@@ -31,7 +31,7 @@ app.use((req, res, next) => {
   if (isLocalhost || origin === allowed) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,PATCH,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   res.setHeader('Vary', 'Origin');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -55,11 +55,15 @@ function saveSubs(subs) {
 
 // ── POST /subscribe  — save a browser subscription ──
 app.post('/subscribe', (req, res) => {
-  const sub = req.body;
-  if (!sub?.endpoint) return res.status(400).json({ error: 'Invalid subscription' });
+  const { endpoint, expirationTime, keys, user } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'Invalid subscription' });
   const subs = loadSubs();
-  if (!subs.find(s => s.endpoint === sub.endpoint)) {
-    subs.push(sub);
+  const existing = subs.find(s => s.endpoint === endpoint);
+  if (existing) {
+    if (user) existing.user = user;
+    saveSubs(subs);
+  } else {
+    subs.push({ endpoint, expirationTime: expirationTime ?? null, keys, user: user ?? {}, groups: [], subscribedAt: new Date().toISOString() });
     saveSubs(subs);
   }
   res.status(201).json({ ok: true });
@@ -72,33 +76,53 @@ app.delete('/subscribe', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── POST /send — send a push to all subscribers ──
-// Body: { title, body, url, tag, secret }
-// Protect with a simple shared secret (set PUSH_SECRET in .env)
+// ── POST /send — send a targeted push notification ──
 app.post('/send', async (req, res) => {
   if (process.env.PUSH_SECRET && req.body.secret !== process.env.PUSH_SECRET) {
     return res.status(403).json({ error: 'Forbidden' });
   }
-  const { title = 'Betagro HR Portal', body = '', url = '/', tag = 'btg-hr', icon } = req.body;
+  const { title = 'Betagro HR Portal', body = '', url = '/', tag = 'btg-hr', icon, targets } = req.body;
   const payload = JSON.stringify({ title, body, url, tag, icon: icon ?? '/icon-192.svg' });
 
-  const subs    = loadSubs();
+  let subs = loadSubs();
+  if (targets?.type === 'groups' && targets.values?.length > 0) {
+    subs = subs.filter(s => (s.groups ?? []).some(g => targets.values.includes(g)));
+  } else if (targets?.type === 'users' && targets.values?.length > 0) {
+    subs = subs.filter(s => targets.values.includes(s.endpoint));
+  }
+
   const results = await Promise.allSettled(
     subs.map(sub => webpush.sendNotification(sub, payload))
   );
-
   const failed = results.filter(r => r.status === 'rejected').length;
-  console.log(`[Push] Sent ${subs.length - failed}/${subs.length}`);
-  res.json({ sent: subs.length - failed, failed });
+  console.log(`[Push] Sent ${subs.length - failed}/${subs.length} (target: ${targets?.type ?? 'all'})`);
+  res.json({ sent: subs.length - failed, failed, total: loadSubs().length });
 });
 
-// ── GET /subscribers — return subscriber count ──
+// ── GET /subscribers — return subscriber list with user & group info ──
 app.get('/subscribers', (_req, res) => {
   const subs = loadSubs();
   res.json({
     count: subs.length,
-    domains: subs.map(s => { try { return new URL(s.endpoint).hostname; } catch { return 'unknown'; } }),
+    subscribers: subs.map(s => ({
+      endpoint: s.endpoint,
+      user: s.user ?? {},
+      groups: s.groups ?? [],
+      subscribedAt: s.subscribedAt,
+    })),
   });
+});
+
+// ── PATCH /subscribers/groups — assign groups to a subscriber ──
+app.patch('/subscribers/groups', (req, res) => {
+  const { endpoint, groups } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'Missing endpoint' });
+  const subs = loadSubs();
+  const sub = subs.find(s => s.endpoint === endpoint);
+  if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
+  sub.groups = Array.isArray(groups) ? groups : [];
+  saveSubs(subs);
+  res.json({ ok: true, groups: sub.groups });
 });
 
 // ── GET /vapid-public-key — let frontend fetch the key ──
